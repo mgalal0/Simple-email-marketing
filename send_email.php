@@ -24,6 +24,27 @@ function getAvailableSmtpAccounts($conn) {
     return $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 }
 
+// Function to get the next available SMTP account
+function getNextSmtpAccount($current_index, $smtp_configs) {
+    $next_index = $current_index + 1;
+    if ($next_index >= count($smtp_configs)) {
+        return null;
+    }
+    return $smtp_configs[$next_index];
+}
+
+// Function to configure PHPMailer with SMTP settings
+function configureMailer($mail, $smtp_config) {
+    $mail->isSMTP();
+    $mail->Host = $smtp_config['host'];
+    $mail->SMTPAuth = true;
+    $mail->Username = $smtp_config['username'];
+    $mail->Password = $smtp_config['password'];
+    $mail->SMTPSecure = $smtp_config['encryption'];
+    $mail->Port = $smtp_config['port'];
+    $mail->setFrom($smtp_config['from_email'], $smtp_config['from_name']);
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // Get all active SMTP configurations
     $smtp_configs = getAvailableSmtpAccounts($conn);
@@ -61,20 +82,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             
             // Process each chunk with a different SMTP account
             foreach ($email_chunks as $index => $chunk) {
-                $smtp_config = $smtp_configs[$index];
+                $current_smtp_index = $index;
+                $smtp_config = $smtp_configs[$current_smtp_index];
                 
                 $mail = new PHPMailer(true);
                 try {
                     $mail->CharSet = 'UTF-8';
                     $mail->Encoding = 'base64';
-                    $mail->isSMTP();
-                    $mail->Host = $smtp_config['host'];
-                    $mail->SMTPAuth = true;
-                    $mail->Username = $smtp_config['username'];
-                    $mail->Password = $smtp_config['password'];
-                    $mail->SMTPSecure = $smtp_config['encryption'];
-                    $mail->Port = $smtp_config['port'];
-                    $mail->setFrom($smtp_config['from_email'], $smtp_config['from_name']);
+                    configureMailer($mail, $smtp_config);
                     
                     // Handle attachment
                     if (isset($_FILES['attachment']) && $_FILES['attachment']['error'] == 0) {
@@ -97,23 +112,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     foreach ($chunk as $email) {
                         $mail->clearAddresses();
                         $mail->addAddress($email);
+                        $retry_count = 0;
+                        $max_retries = count($smtp_configs) - $current_smtp_index - 1; // Available remaining SMTP accounts
                         
-                        try {
-                            $mail->send();
-                            $success_count++;
-                            $progress[] = [
-                                'email' => $email,
-                                'success' => true,
-                                'message' => "Sent using SMTP: " . $smtp_config['account_name']
-                            ];
-                            usleep($delay_ms * 1000);
-                        } catch (Exception $e) {
-                            $error_count++;
-                            $progress[] = [
-                                'email' => $email,
-                                'success' => false,
-                                'message' => "Failed using SMTP: " . $smtp_config['account_name'] . " - " . $e->getMessage()
-                            ];
+                        while ($retry_count <= $max_retries) {
+                            try {
+                                $mail->send();
+                                $success_count++;
+                                $progress[] = [
+                                    'email' => $email,
+                                    'success' => true,
+                                    'message' => "Sent using SMTP: " . $smtp_config['account_name']
+                                ];
+                                usleep($delay_ms * 1000);
+                                break; // Email sent successfully, move to next email
+                                
+                            } catch (Exception $e) {
+                                // Get next SMTP account for retry
+                                $next_smtp = getNextSmtpAccount($current_smtp_index + $retry_count, $smtp_configs);
+                                
+                                if ($next_smtp !== null) {
+                                    // Reconfigure mailer with new SMTP settings
+                                    configureMailer($mail, $next_smtp);
+                                    $retry_count++;
+                                    $progress[] = [
+                                        'email' => $email,
+                                        'success' => false,
+                                        'message' => "Failed with SMTP: " . $smtp_config['account_name'] . " - Retrying with: " . $next_smtp['account_name']
+                                    ];
+                                    $smtp_config = $next_smtp; // Update current SMTP config for next iteration
+                                } else {
+                                    // No more SMTP accounts available
+                                    $error_count++;
+                                    $progress[] = [
+                                        'email' => $email,
+                                        'success' => false,
+                                        'message' => "Failed after {$retry_count} retries - Final error: " . $e->getMessage()
+                                    ];
+                                    break;
+                                }
+                            }
                         }
                     }
                 } catch (Exception $e) {
@@ -172,6 +210,7 @@ $recent_campaigns = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $smtp_count = count(getAvailableSmtpAccounts($conn));
 $max_emails = $smtp_count * 400;
 ?>
+
 
 
     <!DOCTYPE html>
