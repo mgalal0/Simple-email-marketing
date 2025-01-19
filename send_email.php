@@ -1,151 +1,179 @@
-    <?php
-    // send_email.php
-    require 'vendor/autoload.php';
-    require_once 'config.php';
-    require_once 'components/sidebar.php';
-    use PHPMailer\PHPMailer\PHPMailer;
-    use PHPMailer\PHPMailer\Exception;
-    if (isset($_POST['request_type']) && $_POST['request_type'] === 'ajax') {
-        // Prevent any HTML output
-        ob_clean();
-        header('Content-Type: application/json');
-    }
+<?php
+// send_email.php
+require 'vendor/autoload.php';
+require_once 'config.php';
+require_once 'components/sidebar.php';
+use PHPMailer\PHPMailer\PHPMailer;
+use PHPMailer\PHPMailer\Exception;
+
+if (isset($_POST['request_type']) && $_POST['request_type'] === 'ajax') {
+    ob_clean();
+    header('Content-Type: application/json');
+}
+
+session_start();
+if (!isset($_SESSION['user_id'])) {
+    header("Location: login.php");
+    exit();
+}
+
+// Function to get available SMTP accounts
+function getAvailableSmtpAccounts($conn) {
+    $stmt = $conn->prepare("SELECT * FROM smtp_config WHERE is_active = 1 ORDER BY id");
+    $stmt->execute();
+    return $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // Get all active SMTP configurations
+    $smtp_configs = getAvailableSmtpAccounts($conn);
     
-    session_start();
-    if (!isset($_SESSION['user_id'])) {
-        header("Location: login.php");
-        exit();
-    }
-
-    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-        // Get SMTP configuration
-        $stmt = $conn->prepare("SELECT * FROM smtp_config ORDER BY id DESC LIMIT 1");
-        $stmt->execute();
-        $smtp_config = $stmt->get_result()->fetch_assoc();
+    if (empty($smtp_configs)) {
+        $error = "Please configure at least one SMTP account first";
+        if (isset($_POST['request_type']) && $_POST['request_type'] === 'ajax') {
+            echo json_encode(['success' => false, 'message' => $error]);
+            exit;
+        }
+    } else {
+        // Process email list
+        $email_list = array_filter(explode("\n", $_POST['email_list']));
+        $email_list = array_map('trim', $email_list);
+        $total_emails = count($email_list);
         
-        if (!$smtp_config) {
-            $error = "Please configure SMTP settings first";
+        // Calculate required SMTP accounts (400 emails per account)
+        $emails_per_account = 400;
+        $required_accounts = ceil($total_emails / $emails_per_account);
+        $available_accounts = count($smtp_configs);
+        
+        if ($required_accounts > $available_accounts) {
+            $error = "Not enough SMTP accounts. Need {$required_accounts} accounts for {$total_emails} emails (400 per account). Currently have {$available_accounts} active accounts.";
+            if (isset($_POST['request_type']) && $_POST['request_type'] === 'ajax') {
+                echo json_encode(['success' => false, 'message' => $error]);
+                exit;
+            }
         } else {
-            // Process email list
-            $email_list = array_filter(explode("\n", $_POST['email_list']));
-            $email_list = array_map('trim', $email_list);
+            $success_count = 0;
+            $error_count = 0;
+            $progress = [];
             
-            $mail = new PHPMailer(true);
-            try {
-                $mail->CharSet = 'UTF-8';
-                $mail->Encoding = 'base64';
-                // Server settings
-                $mail->isSMTP();
-                $mail->Host = $smtp_config['host'];
-                $mail->SMTPAuth = true;
-                $mail->Username = $smtp_config['username'];
-                $mail->Password = $smtp_config['password'];
-                $mail->SMTPSecure = $smtp_config['encryption'];
-                $mail->Port = $smtp_config['port'];
+            // Split emails into chunks of 400
+            $email_chunks = array_chunk($email_list, $emails_per_account);
+            
+            // Process each chunk with a different SMTP account
+            foreach ($email_chunks as $index => $chunk) {
+                $smtp_config = $smtp_configs[$index];
                 
-                $mail->setFrom($smtp_config['from_email'], $smtp_config['from_name']);
-                
-                // Handle attachment
-                if (isset($_FILES['attachment']) && $_FILES['attachment']['error'] == 0) {
-                    $allowed = ['jpg', 'jpeg', 'png', 'gif', 'pdf'];
-                    $file_ext = strtolower(pathinfo($_FILES['attachment']['name'], PATHINFO_EXTENSION));
+                $mail = new PHPMailer(true);
+                try {
+                    $mail->CharSet = 'UTF-8';
+                    $mail->Encoding = 'base64';
+                    $mail->isSMTP();
+                    $mail->Host = $smtp_config['host'];
+                    $mail->SMTPAuth = true;
+                    $mail->Username = $smtp_config['username'];
+                    $mail->Password = $smtp_config['password'];
+                    $mail->SMTPSecure = $smtp_config['encryption'];
+                    $mail->Port = $smtp_config['port'];
+                    $mail->setFrom($smtp_config['from_email'], $smtp_config['from_name']);
                     
-                    if (in_array($file_ext, $allowed)) {
-                        $mail->addAttachment($_FILES['attachment']['tmp_name'], $_FILES['attachment']['name']);
+                    // Handle attachment
+                    if (isset($_FILES['attachment']) && $_FILES['attachment']['error'] == 0) {
+                        $allowed = ['jpg', 'jpeg', 'png', 'gif', 'pdf'];
+                        $file_ext = strtolower(pathinfo($_FILES['attachment']['name'], PATHINFO_EXTENSION));
+                        
+                        if (in_array($file_ext, $allowed)) {
+                            $mail->addAttachment($_FILES['attachment']['tmp_name'], $_FILES['attachment']['name']);
+                        }
                     }
-                }
-                
-                // Content
-                $mail->isHTML(true);
-                $mail->Subject = $_POST['subject'];
-                $mail->Body = $_POST['message'];
-                $mail->AltBody = strip_tags($_POST['message']); // Add plain text version
-                
-                $success_count = 0;
-                $error_count = 0;
-                $error_messages = [];
-                $delay_ms = $smtp_config['delay_ms'] ?? 1000; // Default to 1 second if not set
-                $progress = [];
-
-                // Send to each recipient with custom delay
-                foreach ($email_list as $email) {
-                    $mail->clearAddresses();
-                    $mail->addAddress($email);
                     
-                    try {
-                        $mail->send();
-                        $success_count++;
-                        $progress[] = [
-                            'email' => $email,
-                            'success' => true,
-                            'message' => ''
-                        ];
-                        usleep($delay_ms * 1000);
-                    } catch (Exception $e) {
+                    $mail->isHTML(true);
+                    $mail->Subject = $_POST['subject'];
+                    $mail->Body = $_POST['message'];
+                    $mail->AltBody = strip_tags($_POST['message']);
+                    
+                    $delay_ms = $smtp_config['delay_ms'] ?? 1000;
+                    
+                    // Process emails in this chunk
+                    foreach ($chunk as $email) {
+                        $mail->clearAddresses();
+                        $mail->addAddress($email);
+                        
+                        try {
+                            $mail->send();
+                            $success_count++;
+                            $progress[] = [
+                                'email' => $email,
+                                'success' => true,
+                                'message' => "Sent using SMTP: " . $smtp_config['account_name']
+                            ];
+                            usleep($delay_ms * 1000);
+                        } catch (Exception $e) {
+                            $error_count++;
+                            $progress[] = [
+                                'email' => $email,
+                                'success' => false,
+                                'message' => "Failed using SMTP: " . $smtp_config['account_name'] . " - " . $e->getMessage()
+                            ];
+                        }
+                    }
+                } catch (Exception $e) {
+                    // Handle SMTP configuration error
+                    foreach ($chunk as $email) {
                         $error_count++;
                         $progress[] = [
                             'email' => $email,
                             'success' => false,
-                            'message' => $e->getMessage()
+                            'message' => "SMTP Error (" . $smtp_config['account_name'] . "): " . $e->getMessage()
                         ];
                     }
                 }
-                if (isset($_POST['request_type']) && $_POST['request_type'] === 'ajax') {
-                    // Ensure no other output has been sent
-                    ob_clean();
-                    
-                    // Log the email campaign BEFORE sending JSON response
-                    $stmt = $conn->prepare("INSERT INTO email_logs (subject, recipient_count, status) VALUES (?, ?, ?)");
-                    $recipient_count = count($email_list);
-                    $status = "Sent: $success_count, Failed: $error_count";
-                    $stmt->bind_param("sis", $_POST['subject'], $recipient_count, $status);
-                    $stmt->execute();
-                    
-                    // Get the last inserted ID
-                    $campaign_id = $conn->insert_id;
-                    
-                    // Send clean JSON response
-                    header('Content-Type: application/json');
-                    echo json_encode([
-                        'success' => true,
-                        'progress' => $progress,
-                        'summary' => [
-                            'total' => count($email_list),
-                            'success' => $success_count,
-                            'failed' => $error_count
-                        ],
-                        'campaign' => [
-                            'id' => $campaign_id,
-                            'subject' => $_POST['subject'],
-                            'recipient_count' => $recipient_count,
-                            'status' => $status,
-                            'sent_at' => date('Y-m-d H:i:s')
-                        ]
-                    ]);
-                    exit;
-                }   
-                // Log the email campaign
-                $stmt = $conn->prepare("INSERT INTO email_logs (subject, recipient_count, status) VALUES (?, ?, ?)");
-                $recipient_count = count($email_list);
-                $status = "Sent: $success_count, Failed: $error_count";
-                $stmt->bind_param("sis", $_POST['subject'], $recipient_count, $status);
-                $stmt->execute();
-                
-                $success = "Email campaign completed. Successful: $success_count, Failed: $error_count";
-                if (!empty($error_messages)) {
-                    $error = "Some emails failed to send. Details:<br>" . implode("<br>", $error_messages);
-                }
-            } catch (Exception $e) {
-                $error = "Message could not be sent. Mailer Error: {$mail->ErrorInfo}";
             }
+            
+            // Log the campaign
+            $stmt = $conn->prepare("INSERT INTO email_logs (subject, recipient_count, status, smtp_config_id) VALUES (?, ?, ?, ?)");
+            $status = "Sent: $success_count, Failed: $error_count";
+            $current_smtp_id = $smtp_configs[0]['id'];
+            $stmt->bind_param("sisi", $_POST['subject'], $total_emails, $status, $current_smtp_id);
+            $stmt->execute();
+            $campaign_id = $conn->insert_id;
+            
+            if (isset($_POST['request_type']) && $_POST['request_type'] === 'ajax') {
+                echo json_encode([
+                    'success' => true,
+                    'progress' => $progress,
+                    'summary' => [
+                        'total' => $total_emails,
+                        'success' => $success_count,
+                        'failed' => $error_count,
+                        'smtp_accounts_used' => count($email_chunks)
+                    ],
+                    'campaign' => [
+                        'id' => $campaign_id,
+                        'subject' => $_POST['subject'],
+                        'recipient_count' => $total_emails,
+                        'status' => $status,
+                        'sent_at' => date('Y-m-d H:i:s')
+                    ]
+                ]);
+                exit;
+            }
+            
+            $success = "Email campaign completed. Successful: $success_count, Failed: $error_count";
         }
     }
+}
 
-    // Get recent campaigns for display
-    $stmt = $conn->prepare("SELECT * FROM email_logs ORDER BY sent_at DESC LIMIT 5");
-    $stmt->execute();
-    $recent_campaigns = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-    ?>
+// Get recent campaigns for display
+$stmt = $conn->prepare("SELECT * FROM email_logs ORDER BY sent_at DESC LIMIT 5");
+$stmt->execute();
+$recent_campaigns = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+
+// Get SMTP account count for display
+$smtp_count = count(getAvailableSmtpAccounts($conn));
+$max_emails = $smtp_count * 400;
+?>
+
+
     <!DOCTYPE html>
     <html>
     <head>
@@ -163,6 +191,8 @@
     font-size: 0.9rem;
     padding: 4px 8px;
     border-radius: 4px;
+
+
 }
 .log-entry:hover {
     background-color: rgba(0,0,0,0.05);
@@ -222,6 +252,8 @@
         </style>
     </head>
     <body>
+
+    
         <!-- Loading Overlay -->
         <div class="loading-overlay">
             <div class="loading-spinner">
@@ -233,7 +265,14 @@
         </div>
 
         <div class="container-fluid">
+            
             <div class="row">
+            <div class="alert alert-info">
+    <i class="fas fa-info-circle"></i> 
+    Currently <?php echo $smtp_count; ?> active SMTP accounts available.
+    Maximum <?php echo $max_emails; ?> emails can be sent (400 per account).
+</div>
+
                 <?php renderSidebar('send_email'); ?>
                 
                 <div class="col-md-10 p-4">
