@@ -306,15 +306,15 @@ $max_emails = $smtp_count * 400;
         <div class="container-fluid">
             
             <div class="row">
-            <div class="alert alert-info">
-    <i class="fas fa-info-circle"></i> 
-    Currently <?php echo $smtp_count; ?> active SMTP accounts available.
-    Maximum <?php echo $max_emails; ?> emails can be sent (400 per account).
-</div>
 
                 <?php renderSidebar('send_email'); ?>
                 
                 <div class="col-md-10 p-4">
+                <div class="alert alert-info">
+    <i class="fas fa-info-circle"></i> 
+    Currently <?php echo $smtp_count; ?> active SMTP accounts available.
+    Maximum <?php echo $max_emails; ?> emails can be sent (400 per account).
+</div>
                     <h2>Send Email Campaign</h2>
                     
                     <?php if (isset($success)): ?>
