@@ -26,6 +26,8 @@ function getAvailableSmtpAccounts($conn) {
 
 // Function to configure PHPMailer with SMTP settings
 function configureMailer($mail, $smtp_config) {
+    error_log("DEBUG: Configuring SMTP {$smtp_config['username']}");
+    
     $mail->isSMTP();
     $mail->Host = $smtp_config['host'];
     $mail->SMTPAuth = true;
@@ -34,12 +36,152 @@ function configureMailer($mail, $smtp_config) {
     $mail->SMTPSecure = $smtp_config['encryption'];
     $mail->Port = $smtp_config['port'];
     $mail->setFrom($smtp_config['from_email'], $smtp_config['from_name']);
+    
+    // Add debugging
+    $mail->SMTPDebug = 2; // Enable verbose debug output
+    $mail->Debugoutput = function($str, $level) {
+        error_log("SMTP Debug: $str");
+    };
+    
+    // Add timeouts
+    $mail->Timeout = 20; // Increased timeout
+    $mail->SMTPKeepAlive = true;
+}
+
+function processBatch($emails, $smtp_configs, $mail, $conn, $batch_size = 50) {
+    $results = [];
+    $total_success = 0;
+    $total_error = 0;
+    $batch_results = [];
+
+    // Track SMTP status
+    $smtp_usage = array_fill(0, count($smtp_configs), 0);
+    $max_per_smtp = 400;
+
+    foreach ($emails as $email) {
+        $sent = false;
+        
+        // Try each SMTP until success
+        for ($smtp_index = 0; $smtp_index < count($smtp_configs); $smtp_index++) {
+            $smtp_config = $smtp_configs[$smtp_index];
+            
+            // Skip if this SMTP is at limit
+            if ($smtp_usage[$smtp_index] >= $max_per_smtp) {
+                error_log("DEBUG: Skipping SMTP {$smtp_config['username']} - reached limit");
+                continue;
+            }
+
+            error_log("DEBUG: Trying SMTP {$smtp_config['username']} for email {$email}");
+            
+            try {
+                // Reset mailer state
+                $mail->clearAllRecipients();
+                $mail->clearAttachments();
+                $mail->clearCustomHeaders();
+                $mail->clearReplyTos();
+                
+                // Configure SMTP
+                configureMailer($mail, $smtp_config);
+                $mail->addAddress($email);
+                
+                // Try to send
+                if ($mail->send()) {
+                    $smtp_usage[$smtp_index]++;
+                    $total_success++;
+                    $sent = true;
+                    
+                    error_log("DEBUG: Successfully sent via {$smtp_config['username']}");
+                    
+                    $batch_results[] = [
+                        'email' => $email,
+                        'success' => true,
+                        'message' => "Sent via " . $smtp_config['username'] . 
+                                   " (" . $smtp_usage[$smtp_index] . "/" . $max_per_smtp . ")"
+                    ];
+                    
+                    // Successfully sent - break out of SMTP loop
+                    break;
+                }
+            } catch (Exception $e) {
+                error_log("DEBUG: Failed with SMTP {$smtp_config['username']}: " . $e->getMessage());
+                
+                // If this was the last SMTP to try
+                if ($smtp_index === count($smtp_configs) - 1) {
+                    error_log("DEBUG: All SMTPs failed for {$email}");
+                    $total_error++;
+                    $batch_results[] = [
+                        'email' => $email,
+                        'success' => false,
+                        'message' => "Failed with current SMTP: " . $e->getMessage()
+                    ];
+                } else {
+                    error_log("DEBUG: Trying next SMTP for {$email}");
+                }
+                
+                // Small delay before trying next SMTP
+                usleep(100000);
+                continue;
+            }
+        }
+
+        // If email was sent successfully, try to use the same SMTP for next email
+        if ($sent) {
+            // Reorder SMTP configs to try the successful one first next time
+            $successful_config = array_splice($smtp_configs, $smtp_index, 1)[0];
+            array_unshift($smtp_configs, $successful_config);
+            
+            // Also reorder the usage tracking
+            $successful_usage = array_splice($smtp_usage, $smtp_index, 1)[0];
+            array_unshift($smtp_usage, $successful_usage);
+        }
+
+        // Send progress update
+        $smtp_status = [];
+        foreach ($smtp_configs as $index => $config) {
+            $status = $config['username'] . ": " . $smtp_usage[$index] . "/" . $max_per_smtp;
+            if ($sent && $index === 0) {
+                $status .= " (Current)";
+            }
+            $smtp_status[] = $status;
+        }
+        
+        echo json_encode([
+            'type' => 'progress',
+            'batch_results' => $batch_results,
+            'totals' => [
+                'success' => $total_success,
+                'error' => $total_error
+            ],
+            'smtp_status' => $smtp_status,
+            'debug_info' => [
+                'last_attempted_smtp' => $smtp_config['username'],
+                'current_email' => $email,
+                'sent_status' => $sent
+            ]
+        ]) . "\n";
+        ob_flush();
+        flush();
+        
+        // Clear batch results after update
+        $batch_results = [];
+    }
+    
+    return ['success' => $total_success, 'error' => $total_error];
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    // Get all active SMTP configurations
-    $smtp_configs = getAvailableSmtpAccounts($conn);
+    // Set unlimited execution time and disable buffering
+    set_time_limit(0);
+    while (ob_get_level()) ob_end_clean();
     
+    // Set headers for streaming response
+    header('Content-Type: text/event-stream');
+    header('Cache-Control: no-cache');
+    header('Connection: keep-alive');
+    header('X-Accel-Buffering: no'); // Disable nginx buffering
+    
+    // Get SMTP configurations
+    $smtp_configs = getAvailableSmtpAccounts($conn);
     if (empty($smtp_configs)) {
         echo json_encode(['success' => false, 'message' => 'No active SMTP accounts available']);
         exit;
@@ -49,23 +191,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $email_list = array_filter(explode("\n", $_POST['email_list']));
     $email_list = array_map('trim', $email_list);
     $total_emails = count($email_list);
-    
-    $success_count = 0;
-    $error_count = 0;
-    $progress = [];
-    
-    // Initialize counters
-    $current_smtp_index = 0;
-    $emails_sent_current_smtp = 0;
-    $max_emails_per_smtp = 400;
-    
-    // Create PHPMailer instance
+
+    // Initialize mailer
     $mail = new PHPMailer(true);
     $mail->CharSet = 'UTF-8';
     $mail->Encoding = 'base64';
     $mail->isHTML(true);
     
-    // Handle attachment
+    // Set email content
+    $mail->Subject = $_POST['subject'];
+    $mail->Body = $_POST['message'];
+    $mail->AltBody = strip_tags($_POST['message']);
+    
+    // Handle attachment if present
     if (isset($_FILES['attachment']) && $_FILES['attachment']['error'] == 0) {
         $allowed = ['jpg', 'jpeg', 'png', 'gif', 'pdf'];
         $file_ext = strtolower(pathinfo($_FILES['attachment']['name'], PATHINFO_EXTENSION));
@@ -74,87 +212,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    // Set email content
-    $mail->Subject = $_POST['subject'];
-    $mail->Body = $_POST['message'];
-    $mail->AltBody = strip_tags($_POST['message']);
-
-    // Process each email
-    foreach ($email_list as $email) {
-        $sent = false;
-        $attempts = 0;
-        $max_attempts = count($smtp_configs);
-
-        while (!$sent && $attempts < $max_attempts) {
-            // Check if we need to switch SMTP accounts
-            if ($emails_sent_current_smtp >= $max_emails_per_smtp) {
-                $current_smtp_index = ($current_smtp_index + 1) % count($smtp_configs);
-                $emails_sent_current_smtp = 0;
-            }
-
-            try {
-                // Configure current SMTP
-                $smtp_config = $smtp_configs[$current_smtp_index];
-                configureMailer($mail, $smtp_config);
-
-                // Clear previous addresses and add new one
-                $mail->clearAddresses();
-                $mail->addAddress($email);
-
-                // Try to send
-                $mail->send();
-                
-                // Email sent successfully
-                $success_count++;
-                $emails_sent_current_smtp++;
-                $sent = true;
-                
-                $progress[] = [
-                    'email' => $email,
-                    'success' => true,
-                    'message' => "Sent via " . $smtp_config['username']
-                ];
-
-                // Apply delay
-                $delay_ms = $smtp_config['delay_ms'] ?? 1000;
-                usleep($delay_ms * 1000);
-
-            } catch (Exception $e) {
-                // If sending fails, switch to next SMTP account
-                $attempts++;
-                $current_smtp_index = ($current_smtp_index + 1) % count($smtp_configs);
-                $emails_sent_current_smtp = 0;
-
-                // If we've tried all SMTP accounts and still failed
-                if ($attempts >= $max_attempts) {
-                    $error_count++;
-                    $progress[] = [
-                        'email' => $email,
-                        'success' => false,
-                        'message' => "Delivery pending"
-                    ];
-                }
-            }
-        }
-    }
-
+    // Process emails in batches and get totals
+    $results = processBatch($email_list, $smtp_configs, $mail, $conn);
+    
     // Log the campaign
     $stmt = $conn->prepare("INSERT INTO email_logs (subject, recipient_count, status, smtp_config_id) VALUES (?, ?, ?, ?)");
-    $status = "Sent: $success_count, Pending: $error_count";
+    $status = "Sent: {$results['success']}, Failed: {$results['error']}";
     $current_smtp_id = $smtp_configs[0]['id'];
     $stmt->bind_param("sisi", $_POST['subject'], $total_emails, $status, $current_smtp_id);
     $stmt->execute();
     $campaign_id = $conn->insert_id;
-
-    // Return results
+    
+    // Send final completion message
     echo json_encode([
-        'success' => true,
-        'progress' => $progress,
-        'summary' => [
-            'total' => $total_emails,
-            'sent' => $success_count,
-            'pending' => $error_count
-        ],
+        'type' => 'complete',
         'campaign' => [
             'id' => $campaign_id,
             'subject' => $_POST['subject'],
@@ -162,7 +233,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'status' => $status,
             'sent_at' => date('Y-m-d H:i:s')
         ]
-    ]);
+    ]) . "\n";
     exit;
 }
 
@@ -175,7 +246,6 @@ $recent_campaigns = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $smtp_count = count(getAvailableSmtpAccounts($conn));
 $max_emails = $smtp_count * 400;
 ?>
-
 
 
     <!DOCTYPE html>
@@ -438,7 +508,7 @@ $max_emails = $smtp_count * 400;
 
             // Form submission handling
 // Replace the existing form submission code with this updated version
-document.getElementById('emailForm').addEventListener('submit', function(e) {
+document.getElementById('emailForm').addEventListener('submit', async function(e) {
     e.preventDefault();
     
     // Validate emails
@@ -447,16 +517,6 @@ document.getElementById('emailForm').addEventListener('submit', function(e) {
     
     if (emails.length === 0) {
         alert('Please enter at least one email address');
-        return;
-    }
-    
-    // Validate email format
-    const invalidEmails = emails.filter(email => {
-        return !email.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/);
-    });
-    
-    if (invalidEmails.length > 0) {
-        alert('Invalid email addresses found:\n' + invalidEmails.join('\n'));
         return;
     }
     
@@ -479,120 +539,77 @@ document.getElementById('emailForm').addEventListener('submit', function(e) {
     let sentCount = 0;
     let failedCount = 0;
 
-    // Function to update progress
-    function updateProgress(email, success, message = '') {
-        const timestamp = new Date().toLocaleTimeString();
-        const status = success ? 'success' : 'danger';
-        const icon = success ? 'check-circle' : 'times-circle';
-        const result = success ? 'Sent' : 'Failed';
-        
-        // Update counters
-        if (success) sentCount++; else failedCount++;
-        
-        // Calculate progress percentage
-        const progress = ((sentCount + failedCount) / totalEmails) * 100;
-        
-        // Update progress bar
-        progressBar.style.width = `${progress}%`;
-        progressStatus.innerHTML = `Progress: ${sentCount + failedCount} of ${totalEmails} (${sentCount} sent, ${failedCount} failed)`;
-        
-        // Add log entry
-        const logEntry = document.createElement('div');
-        logEntry.className = `log-entry text-${status} mb-1`;
-        logEntry.innerHTML = `
-            <small class="text-muted">${timestamp}</small> 
-            <i class="fas fa-${icon}"></i> 
-            ${result}: ${email}
-            ${message ? `<br><small class="text-muted ps-4">${message}</small>` : ''}
-        `;
-        emailLog.insertBefore(logEntry, emailLog.firstChild);
-    }
-    
-    // Submit the form
-    const formData = new FormData(this);
-    formData.append('request_type', 'ajax');
-    
-    fetch(window.location.href, {
-        method: 'POST',
-        body: formData
-    })
-    .then(response => response.text())
-    .then(data => {
-        try {
-            const result = JSON.parse(data);
-            if (result.success) {
-                // Update progress for each email
-                if (result.progress) {
-                    result.progress.forEach(item => {
-                        updateProgress(item.email, item.success, item.message);
-                    });
-                }
-                
-                // Update the campaigns list with the new campaign
-                if (result.campaign) {
-                    const campaignsList = document.getElementById('campaignsList');
-                    const newCampaignHtml = `
-                        <div class="list-group-item campaign-card" id="campaign-${result.campaign.id}">
-                            <div class="d-flex justify-content-between align-items-start">
-                                <div>
-                                    <h6 class="mb-1">${result.campaign.subject}</h6>
-                                    <p class="mb-1">Recipients: ${result.campaign.recipient_count}</p>
-                                    <small>Status: ${result.campaign.status}</small>
-                                    <br>
-                                    <small class="text-muted">${result.campaign.sent_at}</small>
-                                </div>
-                                <button class="delete-btn" onclick="deleteCampaign(${result.campaign.id})">
-                                    <i class="fas fa-trash"></i>
-                                </button>
-                            </div>
-                        </div>`;
+    try {
+        const response = await fetch(window.location.href, {
+            method: 'POST',
+            body: new FormData(this)
+        });
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+
+        while (true) {
+            const {value, done} = await reader.read();
+            if (done) break;
+            
+            const text = decoder.decode(value);
+            const lines = text.split('\n').filter(line => line.trim());
+            
+            for (const line of lines) {
+                try {
+                    const data = JSON.parse(line);
                     
-                    // Remove "No campaigns" message if it exists
-                    const noCampaignsMsg = campaignsList.querySelector('p.mb-1');
-                    if (noCampaignsMsg && noCampaignsMsg.textContent === 'No campaigns sent yet') {
-                        noCampaignsMsg.closest('.list-group-item').remove();
+                    if (data.type === 'progress' && data.batch_results) {
+                        data.batch_results.forEach(result => {
+                            // Update progress
+                            if (result.success) sentCount++; else failedCount++;
+                            const progress = ((sentCount + failedCount) / totalEmails) * 100;
+                            
+                            // Update UI
+                            progressBar.style.width = `${progress}%`;
+                            progressStatus.innerHTML = `Progress: ${sentCount + failedCount} of ${totalEmails} (${sentCount} sent, ${failedCount} failed)`;
+                            
+                            // Add log entry
+                            const timestamp = new Date().toLocaleTimeString();
+                            const status = result.success ? 'success' : 'danger';
+                            const icon = result.success ? 'check-circle' : 'times-circle';
+                            
+                            const logEntry = document.createElement('div');
+                            logEntry.className = `log-entry text-${status} mb-1`;
+                            logEntry.innerHTML = `
+                                <small class="text-muted">${timestamp}</small> 
+                                <i class="fas fa-${icon}"></i> 
+                                ${result.email}
+                                ${result.message ? `<br><small class="text-muted ps-4">${result.message}</small>` : ''}
+                            `;
+                            emailLog.insertBefore(logEntry, emailLog.firstChild);
+                        });
+                    } else if (data.type === 'complete') {
+                        const completionMessage = document.createElement('div');
+                        completionMessage.className = 'alert alert-success mt-2';
+                        completionMessage.textContent = `Campaign completed: ${sentCount} sent, ${failedCount} failed`;
+                        emailLog.insertBefore(completionMessage, emailLog.firstChild);
                     }
-                    
-                    // Add new campaign to the top of the list
-                    campaignsList.insertAdjacentHTML('afterbegin', newCampaignHtml);
+                } catch (e) {
+                    console.error('Error parsing line:', e);
                 }
-                
-                // Reset form
-                $('#messageEditor').summernote('reset');
-                this.reset();
-                
-                // Add completion message
-                const completionMessage = document.createElement('div');
-                completionMessage.className = 'alert alert-info mt-2';
-                completionMessage.textContent = `Campaign completed: ${sentCount} sent, ${failedCount} failed`;
-                emailLog.insertBefore(completionMessage, emailLog.firstChild);
-            } else {
-                throw new Error(result.message || 'Error sending emails');
             }
-        } catch (e) {
-            console.error('Error:', e);
-            const errorMessage = document.createElement('div');
-            errorMessage.className = 'alert alert-danger mt-2';
-            errorMessage.textContent = e.message;
-            emailLog.insertBefore(errorMessage, emailLog.firstChild);
         }
-    })
-    .catch(error => {
+    } catch (error) {
         console.error('Error:', error);
         const errorMessage = document.createElement('div');
         errorMessage.className = 'alert alert-danger mt-2';
         errorMessage.textContent = 'Error sending emails: ' + error.message;
         emailLog.insertBefore(errorMessage, emailLog.firstChild);
-    })
-    .finally(() => {
-        // Hide loading overlay and reset button after short delay
-        setTimeout(() => {
-            document.querySelector('.loading-overlay').style.display = 'none';
-            submitButton.disabled = false;
-            submitButton.innerHTML = '<i class="fas fa-paper-plane me-2"></i>Send Campaign';
-        }, 1000);
-    });
+    } finally {
+        // Hide loading overlay and reset button
+        document.querySelector('.loading-overlay').style.display = 'none';
+        submitButton.disabled = false;
+        submitButton.innerHTML = '<i class="fas fa-paper-plane me-2"></i>Send Campaign';
+    }
 });
+
+
         </script>
     </body>
     </html>
